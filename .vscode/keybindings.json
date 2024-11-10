@@ -1,0 +1,8 @@
+{
+    "key": "enter",
+    "command": "extension.multiCommand.execute",
+    "args": {
+        "command": "multiCommand.enterExec"
+    },
+    "when": "inDebugRepl"
+}
