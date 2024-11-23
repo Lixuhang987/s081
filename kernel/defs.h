@@ -1,3 +1,4 @@
+#define LAB_NET 1
 struct buf;
 struct context;
 struct file;
