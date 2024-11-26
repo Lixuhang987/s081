@@ -54,6 +54,8 @@ binit(void)
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
     initsleeplock(&b->lock, "buffer");
     b->ticks = 0;
+    b->valid = 0;
+    b->refcnt = 0;
   }
 
   memset(bcache.nclock, 0, BUCKETS*sizeof(int));
@@ -67,33 +69,44 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
-  acquire(&bcache.lock[HASH(blockno)]);
- re:
+  int bucket = HASH(blockno);
+  acquire(&bcache.lock[bucket]);
 
   // Is the block already cached?
   for(int i = 0; i < NBUF; i++){
-    b = bcache.hash[HASH(blockno)][i];
+    b = bcache.hash[bucket][i];
     if(b && b->dev == dev && b->blockno == blockno){
       b->refcnt++;
-      release(&bcache.lock[HASH(blockno)]);
+      release(&bcache.lock[bucket]);
       acquiresleep(&b->lock);
       return b;
     }
   }
-  while (bcache.nclock[HASH(blockno)])
+  while (bcache.nclock[bucket])
   {
-    sleep(&bcache.nclock[HASH(blockno)], &bcache.lock[HASH(blockno)]);
-    goto re; 
+    sleep(&bcache.nclock[bucket], &bcache.lock[bucket]);
+    for (int i = 0; i < NBUF; i++)
+    {
+      b = bcache.hash[bucket][i];
+      if (b && b->dev == dev && b->blockno == blockno)
+      {
+        b->refcnt++;
+        release(&bcache.lock[bucket]);
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
   }
-  bcache.nclock[HASH(blockno)] = 1;
-  release(&bcache.lock[HASH(blockno)]);
+  bcache.nclock[bucket] = 1;
+  release(&bcache.lock[bucket]);
 
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
   acquire(&bcache.block);
-  acquire(&bcache.lock[HASH(blockno)]);
+  acquire(&bcache.lock[bucket]);
+ re:
   int free = 0;
-  struct buf *lru = bcache.buf;
+  struct buf *lru = 0;
   for(b = bcache.buf; b < bcache.buf + NBUF; b++){
     if(b->refcnt == 0) {
       if (!free || b->ticks < lru->ticks)
@@ -101,27 +114,33 @@ bget(uint dev, uint blockno)
       free = 1;
     }
   }
-  if (free)
+  if (free && lru)
   {
     int id = lru->blockno;
-    if (HASH(id) != HASH(blockno))
+    if (HASH(id) != bucket)
       acquire(&bcache.lock[HASH(id)]);
+    if (lru->refcnt > 0)
+    {
+      release(&bcache.lock[HASH(id)]);
+      goto re;
+    }
     int i = 0;
     for (i = 0; i < NBUF; i++)
       if (bcache.hash[HASH(id)][i] && bcache.hash[HASH(id)][i]->blockno == id)
         bcache.hash[HASH(id)][i] = 0;
-    if (HASH(id) != HASH(blockno))
+    if (HASH(id) != bucket)
       release(&bcache.lock[HASH(id)]);
     lru->dev = dev;
     lru->blockno = blockno;
     lru->valid = 0;
     lru->refcnt = 1;
-    for (i = 0; bcache.hash[HASH(blockno)][i] != 0;)
+    lru->ticks = 0;
+    for (i = 0; bcache.hash[bucket][i] != 0;)
       i++;
-    bcache.hash[HASH(blockno)][i] = lru;
-    bcache.nclock[HASH(blockno)] = 0;
-    wakeup(&bcache.nclock[HASH(blockno)]);
-    release(&bcache.lock[HASH(blockno)]);
+    bcache.hash[bucket][i] = lru;
+    bcache.nclock[bucket] = 0;
+    wakeup(&bcache.nclock[bucket]);
+    release(&bcache.lock[bucket]);
     release(&bcache.block);
     acquiresleep(&lru->lock);
     return lru;
