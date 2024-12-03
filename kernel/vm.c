@@ -5,6 +5,11 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "fcntl.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "proc.h"
+#include "file.h"
 
 /*
  * the kernel's page table.
@@ -175,7 +180,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -309,7 +314,12 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
+    if (!(*pte & PTE_W) && !(*pte & PTE_R))
+    {
+      mappages(new, i, PGSIZE, 0, PTE_U);
+      continue;
+    }
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -431,4 +441,90 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+uint64
+mmap(int size, int prot, int flag, int fd)
+{
+  struct proc *p = myproc();
+  if (flag & MAP_SHARED)
+    if (!p->ofile[fd]->writable && (prot & PROT_WRITE))
+      return -1;
+  filedup(p->ofile[fd]);
+  uint64 psz = p->sz;
+  struct vma *v = p->vma;
+  while (v->valid)
+    v++;
+  v->valid = 1;
+  v->addr = p->sz;
+  v->f = p->ofile[fd];
+  v->flag = flag;
+  v->prot = prot;
+  v->offset = 0;
+  v->size = size;
+  mappages(p->pagetable, p->sz, size, 0, PTE_U);
+  p->sz += size;
+  return psz;
+}
+
+int
+mmap_handler(uint64 va, uint64 cause)
+{
+  struct proc *p = myproc();
+  if (va > p->sz)
+    return -1;
+  for (struct vma *v = p->vma; v < p->vma + 16; v++)
+  {
+    if (v->valid && va >= v->addr && va < v->addr + v->size)
+    {
+      if ((!(v->prot & PROT_READ) && cause == 13) || (!(v->prot & PROT_WRITE) && cause == 15))
+        return -1;
+      if (v->prot & PROT_WRITE)
+        v->dirty = 1;
+      void *mem = kalloc();
+      memset(mem, 0, PGSIZE);
+      struct file *f = v->f;
+      uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 0);
+      mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem,
+        PTE_U | ((v->prot & PROT_READ) ? PTE_R : 0) | ((v->prot & PROT_WRITE) ? PTE_W : 0));
+      ilock(f->ip);
+      readi(f->ip, 1, PGROUNDDOWN(va), v->offset + PGROUNDDOWN(va) - v->addr, PGSIZE);
+      iunlock(f->ip);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int
+munmap(uint64 va, int size)
+{
+  struct proc *p = myproc();
+  for (struct vma *v = p->vma; v < p->vma + 16; v++)
+  {
+    if (v->valid && va >= v->addr && size <= v->size)
+    {
+      struct file *f = v->f;
+      if (v->dirty && (v->flag & MAP_SHARED))
+      {
+        begin_op();
+        ilock(f->ip);
+        for (int i = 0; i < size; i += PGSIZE)
+          if (*walk(p->pagetable, va + i, 0) & PTE_D)
+            writei(f->ip, 1, va, v->offset + va + i - v->addr, PGSIZE);
+        iunlock(f->ip);
+        end_op();
+      }
+      uvmunmap(p->pagetable, va, size/PGSIZE, 0);
+      v->size -= size;
+      if (!v->size)
+      {
+        v->valid = 0;
+        fileclose(f);
+      }
+      return 0;
+    }
+  }
+  return -1;
 }
